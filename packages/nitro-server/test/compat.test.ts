@@ -13,7 +13,10 @@ import { getLegacyRuntimeConfigPath, getNitroPackageResolutions, getServerImport
 import { getH3ImportsPreset, nuxtServerImportsPreset, v2ImportsPreset } from '../src/imports.ts'
 import { nitroBuildDiagnostics } from '../src/diagnostics.ts'
 import { kServerApi } from '@nuxt/kit/internal'
-import { H3 } from 'nitro/h3'
+import { H3, mockEvent } from 'nitro/h3'
+import { createNitro } from 'nitro/builder'
+import { createMatcherFromFind, ruleHandlers } from 'h3/rules'
+import { compileFindRouteRules } from 'h3/rules/compiler'
 
 /** An entry as `addServerHandler()` leaves it, having resolved the variant it registered. */
 function declared<T extends object> (entry: T, api: string): any {
@@ -41,6 +44,14 @@ function createNuxt (options: Record<string, any> = {}) {
 
 function createLateNitro (nitroConfig: NitroConfig) {
   return { options: { alias: {}, plugins: nitroConfig.plugins, handlers: nitroConfig.handlers }, hooks: createHooks() } as any
+}
+
+/** Evaluate the route-rules lookup Nitro emits, independently of its in-memory matcher. */
+function compileNitroRouteRules (options: NitroConfig) {
+  const code = compileFindRouteRules(options.routeRules || {}, { baseURL: options.baseURL, preMerge: true })
+  // Only rule data is compared here; cache/proxy middleware is not executed.
+  const find = new Function('__ruleHandlers__$headers', '__ruleHandlers__$cache', `return ${code}`)(ruleHandlers.headers, undefined)
+  return createMatcherFromFind(find)
 }
 
 describe('getNitroPackageResolutions', () => {
@@ -951,6 +962,116 @@ export default defineCachedHandler(() => createError({ statusCode: 404 }))`)
     expect(await fetchText('/_migrated')).toBe('migrated /_migrated')
     expect(await fetchText('/_migrated/deep')).toBe('fallback')
     vi.restoreAllMocks()
+  })
+
+  it.each([false, true])('resolves live legacy handler rules from the current Nitro builder (Vite environment: %s)', async (nitroViteEnvironment) => {
+    const rootDir = mkdtempSync(join(tmpdir(), 'nitro-compat-dev-rules-'))
+    onTestFinished(() => rmSync(rootDir, { recursive: true, force: true }))
+    const nitroConfig: NitroConfig = {
+      rootDir,
+      baseURL: '/base/',
+      compatibilityDate: '2026-09-03',
+      routeRules: {
+        '/**': { headers: { 'x-global': 'yes', 'x-priority': 'global' }, ssr: true },
+        '/_legacy/**': { headers: { 'x-nested': 'yes', 'x-priority': 'nested' }, cache: { maxAge: 60 } },
+        'GET /_legacy/deep': { headers: { 'x-method': 'get', 'x-priority': 'get' }, cache: false },
+        'POST /_legacy/deep': { headers: { 'x-method': 'post' } },
+        '/_legacy/测试': { headers: { 'x-unicode': 'yes' } },
+      },
+    }
+    const devServerHandlers: any[] = [
+      declared({ route: '/base/_legacy', handler: (event: any) => ({ path: event.path, rules: event.context._nitro.routeRules }) }, 'nitro2'),
+    ]
+    const register = await setupNitroCompat(createNuxt({ devServerHandlers, experimental: { nitroViteEnvironment } }), nitroConfig, legacyOff, [])
+    const nitro = await createNitro(nitroConfig)
+    onTestFinished(() => nitro.close())
+    register(nitro)
+    const handler = devServerHandlers[0].handler
+    const expected = compileNitroRouteRules(nitro.options)
+
+    for (const method of ['GET', 'HEAD', 'POST']) {
+      for (const path of ['/base/_legacy/deep', '/base/_legacy/deep/', '/base/_legacy/other', '/base/_legacy/%E6%B5%8B%E8%AF%95', '/outside']) {
+        const event = mockEvent(`http://nuxt${path}?query=1`, { method })
+        const result = await handler(event)
+        expect(result.rules).toEqual(expected(method, path).routeRules)
+        expect(event.url.pathname).toBe(path)
+        if (path.startsWith('/base/_legacy/')) {
+          expect(result.path).toBe(path.slice('/base/_legacy'.length) + '?query=1')
+        }
+      }
+    }
+    const getResult = await handler(mockEvent('http://nuxt/base/_legacy/deep'))
+    expect(getResult.rules).toMatchObject({ headers: { 'x-global': 'yes', 'x-nested': 'yes', 'x-method': 'get', 'x-priority': 'get' } })
+    expect(getResult.rules.cache).toBeUndefined()
+
+    for (const rules of [{ ssr: false }, {}]) {
+      const event = mockEvent('http://nuxt/base/_legacy/deep')
+      event.context.routeRules = rules
+      expect((await handler(event)).rules).toBe(rules)
+    }
+    await nitro.updateConfig({ routeRules: { '/_legacy/deep': { headers: { 'x-reloaded': 'yes' } } } })
+    expect((await handler(mockEvent('http://nuxt/base/_legacy/deep'))).rules).toEqual({ headers: { 'x-reloaded': 'yes' } })
+  })
+
+  it.each([false, true])('matches partially overlapping rules accepted by Nitro (Vite environment: %s)', async (nitroViteEnvironment) => {
+    const rootDir = mkdtempSync(join(tmpdir(), 'nitro-compat-overlap-'))
+    onTestFinished(() => rmSync(rootDir, { recursive: true, force: true }))
+    const nitroConfig: NitroConfig = {
+      rootDir,
+      compatibilityDate: '2026-09-03',
+      routeRules: {
+        '/_legacy/:id': { headers: { 'x-literal': 'yes' } },
+        '/:section/detail': { headers: { 'x-parameter': 'yes' } },
+      },
+    }
+    const devServerHandlers: any[] = [{ route: '/_legacy', handler: (event: any) => event.context._nitro.routeRules }]
+    const register = await setupNitroCompat(createNuxt({ devServerHandlers, experimental: { nitroViteEnvironment } }), nitroConfig, legacyOff, [])
+    const nitro = await createNitro(nitroConfig)
+    onTestFinished(() => nitro.close())
+    register(nitro)
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    onTestFinished(() => warn.mockRestore())
+    const expected = compileNitroRouteRules(nitro.options)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('falling back to plain compilation'))
+    const result = await devServerHandlers[0].handler(mockEvent('http://nuxt/_legacy/detail'))
+    expect(result).toEqual(expected('GET', '/_legacy/detail').routeRules)
+    expect(result).toEqual({ headers: { 'x-literal': 'yes', 'x-parameter': 'yes' } })
+  })
+
+  it.each(['/', '/base/'])('uses Nitro compiled path matching under baseURL %s', async (baseURL) => {
+    const rootDir = mkdtempSync(join(tmpdir(), 'nitro-compat-compiled-rules-'))
+    onTestFinished(() => rmSync(rootDir, { recursive: true, force: true }))
+    const nitroConfig: NitroConfig = {
+      rootDir,
+      baseURL,
+      compatibilityDate: '2026-09-03',
+      routeRules: {
+        '/**': { headers: { 'x-global': 'yes', 'x-priority': 'global' } },
+        '/_legacy/:id': { headers: { 'x-priority': 'parameter' }, cache: { maxAge: 60 } },
+        '/_legacy/b/': { headers: { 'x-priority': 'literal' } },
+        'GET /_legacy/b/': { headers: { 'x-method': 'get' }, cache: false },
+      },
+    }
+    const devServerHandlers: any[] = [{ route: '/_legacy', handler: (event: any) => event.context._nitro.routeRules }]
+    const register = await setupNitroCompat(createNuxt({ devServerHandlers }), nitroConfig, legacyOff, [])
+    const nitro = await createNitro(nitroConfig)
+    onTestFinished(() => nitro.close())
+    register(nitro)
+    const expected = compileNitroRouteRules(nitro.options)
+    for (const method of ['GET', 'HEAD', 'POST']) {
+      for (const path of ['/_legacy/b', '/_legacy/b/', '/_legacy/%62']) {
+        const pathname = baseURL.slice(0, -1) + path
+        const event = mockEvent(`http://nuxt${pathname}`, { method })
+        const lookupPath = event.url.pathname
+        const result = await devServerHandlers[0].handler(event)
+        expect(result).toEqual(expected(method, lookupPath).routeRules)
+      }
+    }
+    const encoded = mockEvent(`http://nuxt${baseURL}_legacy/%62`)
+    expect(encoded.url.pathname).toBe(baseURL + '_legacy/b')
+    const encodedRules = await devServerHandlers[0].handler(encoded)
+    expect(encodedRules).toMatchObject({ headers: { 'x-priority': 'literal', 'x-method': 'get' } })
+    expect(encodedRules.cache).toBeUndefined()
   })
 
   it('absorbs handlers pushed straight into `nitro.options` after `nitro:config`', async () => {

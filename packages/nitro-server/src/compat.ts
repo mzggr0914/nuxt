@@ -18,6 +18,8 @@ import { distDir, nitroImplicitDependencies, toArray } from './utils.ts'
 import { nitroBuildDiagnostics } from './diagnostics.ts'
 import { getH3ExportNames, getH3ImportsPreset, getNuxtServerImportsPreset, nuxtServerImportsPreset, v2ImportsPreset } from './imports.ts'
 import { migratedPlugins, serverApiOf } from './registrations.ts'
+import { wrapLegacyHandler } from './runtime/compat/handler.ts'
+import type { RouteRulesResolver } from './runtime/compat/event-bridge.ts'
 
 /**
  * Granular toggles for the opt-in `nitroLegacy` layer.
@@ -732,6 +734,9 @@ export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, le
     }
   }
 
+  let devNitro: Pick<Nitro, 'options'> | undefined
+  let resolveDevRouteRules: RouteRulesResolver | undefined
+
   // dev handlers are live functions, so they are wrapped in place. An untagged one is v2 by
   // the same contract as an untagged `addServerHandler`, and there is no file to classify it by
   for (const handler of nuxt.options.devServerHandlers) {
@@ -746,9 +751,9 @@ export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, le
       entry.middleware = true
       const base = widenLegacyHandlerRoute(entry, report) ?? LITERAL_WILDCARD_ROUTE_RE.exec(entry.route!)?.[1]
       if (typeof entry.handler === 'function') {
-        // nitro runtime imports warn when loaded outside a Nitro build
-        const { wrapLegacyHandler } = await import('./runtime/compat/wrapper.ts')
-        entry.handler = wrapLegacyHandler(entry.handler, base) as typeof entry.handler
+        // These handlers run in the builder's dev server, outside the Nitro runtime.
+        resolveDevRouteRules ||= await createDevRouteRulesResolver(() => devNitro?.options || nitroConfig)
+        entry.handler = wrapLegacyHandler(entry.handler, base, resolveDevRouteRules) as typeof entry.handler
       }
     }
   }
@@ -1090,6 +1095,7 @@ export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, le
   // modules pushing straight into `nitro.options` from `nitro:init` are too late for the
   // pass above, but the transform only consults the scope at build time
   const registerLateScope = (nitro: Pick<Nitro, 'options' | 'hooks'>) => {
+    devNitro = nitro
     // templates may await hooks that run after `nitro:init`, such as `pages:resolved`
     nitro.hooks.hookOnce('build:before', () => renderDeferredVirtuals(nitro))
 
@@ -1188,6 +1194,38 @@ export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, le
   }
 
   return registerLateScope
+}
+
+/** Use Nitro's H3 matcher and current builder options without loading its virtual runtime. */
+async function createDevRouteRulesResolver (options: () => Pick<NitroConfig, 'routeRules' | 'baseURL'>): Promise<RouteRulesResolver> {
+  const h3Rules = resolveModulePath('h3/rules', { from: resolveModulePath('nitro/h3', { from: import.meta.url }) })
+  const h3Compiler = resolveModulePath('h3/rules/compiler', { from: h3Rules })
+  const { createMatcherFromFind } = await import(pathToFileURL(h3Rules).href) as typeof import('h3/rules')
+  const { compileFindRouteRules, DEFAULT_RUNTIME_RULES } = await import(pathToFileURL(h3Compiler).href) as typeof import('h3/rules/compiler')
+  let previousRules: NitroConfig['routeRules']
+  let previousBase: string | undefined
+  let matcher: ReturnType<typeof createMatcherFromFind> | undefined
+  return (event, pathname) => {
+    if (event.context.routeRules) {
+      return event.context.routeRules
+    }
+    const { routeRules, baseURL } = options()
+    if (!matcher || previousRules !== routeRules || previousBase !== baseURL) {
+      previousRules = routeRules
+      previousBase = baseURL
+      // Use the same compiled lookup and fallback as Nitro, including overlapping patterns.
+      const code = compileFindRouteRules(routeRules || {}, {
+        baseURL,
+        preMerge: true,
+        handlersImportName: 'handlers',
+      })
+      // These handlers read rule data; they do not execute route-rule middleware.
+      const find = new Function(...Object.keys(DEFAULT_RUNTIME_RULES).map(name => `handlers$${name}`), `return ${code}`)()
+      matcher = createMatcherFromFind(find)
+    }
+    // h3's pathname includes the app base and was captured before stripping a mount.
+    return matcher(event.req.method, pathname).routeRules
+  }
 }
 
 /** Nitro v3 requires a `route`; a v2 handler without one was a global middleware. */
